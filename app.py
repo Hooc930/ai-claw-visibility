@@ -48,7 +48,7 @@ except ImportError:
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DB_PATH   = "/home/ubuntu/clawd/ai-claw-visibility/analyses.db"
+DB_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyses.db")
 MODELS    = ["ChatGPT", "Gemini", "Claude"]
 COUNTRIES = {"US": "United States", "UK": "United Kingdom", "DE": "Germany",
              "FR": "France", "IL": "Israel"}
