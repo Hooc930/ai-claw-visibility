@@ -1417,7 +1417,7 @@ def tab_executive(m: dict):
     col_gauge, col_insight = st.columns([1,1], gap="large")
 
     with col_gauge:
-        st.plotly_chart(chart_gauge(score), use_container_width=True)
+        st.plotly_chart(chart_gauge(score), width="stretch")
         c1, c2 = st.columns(2)
         with c1:
             delta_vis = f"+{m['visibility_pct']-50:.0f}%" if m['visibility_pct']>50 else f"{m['visibility_pct']-50:.0f}%"
@@ -1457,7 +1457,7 @@ def tab_executive(m: dict):
             st.markdown("#### 📊 Model Comparison")
             _fig = chart_model_bars(m["per_model"])
             if _fig:
-                st.plotly_chart(_fig, use_container_width=True)
+                st.plotly_chart(_fig, width="stretch")
 
     st.info("⏰ Point-in-time snapshot — AI responses vary daily. Run regularly to track trends.")
 
@@ -1545,7 +1545,7 @@ def tab_per_model(m: dict):
             col_pie, col_src = st.columns([1,1])
             with col_pie:
                 st.plotly_chart(chart_sentiment_pie(d["pos"],d["neu"],d["neg"],model),
-                                use_container_width=True)
+                                width="stretch")
             with col_src:
                 st.markdown("**Top Cited Sources**")
                 dc = Counter(d["cited_domains"])
@@ -1554,7 +1554,7 @@ def tab_per_model(m: dict):
                         [{"Domain":dom,"Cited":cnt,"Category":categorize(dom)}
                          for dom,cnt in dc.most_common(6)]
                     )
-                    st.dataframe(df_s, hide_index=True, use_container_width=True)
+                    st.dataframe(df_s, hide_index=True, width="stretch")
                 else:
                     st.caption("No source URLs extracted")
 
@@ -1596,10 +1596,10 @@ def tab_sources(m: dict):
         df["Competitor?"] = df["Domain"].apply(
             lambda d: "⚠️ Yes" if any(c in d.replace("-","") for c in comp_domains) else "—"
         )
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
         _fig_s = chart_sources_bar(m["top_domains"])
         if _fig_s:
-            st.plotly_chart(_fig_s, use_container_width=True)
+            st.plotly_chart(_fig_s, width="stretch")
     else:
         st.info("No source URLs were extracted from AI responses.")
 
@@ -1610,11 +1610,11 @@ def tab_sources(m: dict):
         df2["Mention Rate"] = (df2["Mentions"] / m["total_queries"] * 100).apply(lambda x: f"{x:.0f}%")
         c1, c2 = st.columns([1,1])
         with c1:
-            st.dataframe(df2, use_container_width=True, hide_index=True)
+            st.dataframe(df2, width="stretch", hide_index=True)
         with c2:
             _fig_c = chart_competitor_bar(m["top_comps"])
             if _fig_c:
-                st.plotly_chart(_fig_c, use_container_width=True)
+                st.plotly_chart(_fig_c, width="stretch")
     else:
         st.info("No competitor brands detected in responses.")
 
@@ -1803,7 +1803,7 @@ def tab_raw(m: dict):
             "Model":             r["model"],
             "Prompt":            r["prompt"],
             "Mentioned":         "✅" if r["brand_mentioned"] else "❌",
-            "Position":          r["first_pos"] if r["brand_mentioned"] else "—",
+            "Position":          r["first_pos"] if r["brand_mentioned"] else None,
             "Sentiment":         r["sentiment"],
             "Sent Score":        f"{r['sent_score']:.2f}",
             "Sources":           len(r["cited_domains"]),
@@ -1814,7 +1814,7 @@ def tab_raw(m: dict):
             "Response Preview":  r["response"][:120].replace("\n"," ")+"...",
         })
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
 
     c1, c2 = st.columns(2)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
@@ -1968,7 +1968,7 @@ def main():
         )
         use_browser = st.toggle(
             "🌐 Live Browser Scraping",
-            value=False,
+            value=True,
             disabled=not browser_ok,
             help=browser_help,
         )
@@ -1990,7 +1990,7 @@ def main():
         st.markdown("---")
         run_btn = st.button(
             "🔍 Run AI Visibility Analysis",
-            use_container_width=True, type="primary"
+            width="stretch", type="primary"
         )
 
         st.markdown("---")
