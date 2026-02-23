@@ -1,7 +1,8 @@
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║           AI CLAW VISIBILITY ANALYZER — v2 (Browser-Only)              ║
-# ║  Architecture: Pure Playwright browser automation, zero API keys        ║
-# ║  Querying: chatgpt.com · gemini.google.com · claude.ai                 ║
+# ║           AI CLAW VISIBILITY ANALYZER — v3 (Bulletproof)               ║
+# ║  Architecture: Playwright browser automation, zero API keys             ║
+# ║  Querying: gemini.google.com · claude.ai (ChatGPT: Cloudflare-blocked) ║
+# ║  Public: https://nongutturally-calcicolous-sanora.ngrok-free.dev        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 import streamlit as st
 
@@ -49,7 +50,10 @@ except ImportError:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DB_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyses.db")
-MODELS    = ["ChatGPT", "Gemini", "Claude"]
+MODELS         = ["Gemini", "Claude"]       # ChatGPT skipped — Cloudflare blocks headless
+MODELS_ALL     = ["ChatGPT", "Gemini", "Claude"]  # full list for display/charts
+CHATGPT_SKIP   = True
+CHATGPT_REASON = "Cloudflare bot protection blocks headless browsers"
 COUNTRIES = {"US": "United States", "UK": "United Kingdom", "DE": "Germany",
              "FR": "France", "IL": "Israel"}
 
@@ -263,37 +267,49 @@ details summary { font-weight:500; }
 # ║  DATABASE                                                    ║
 # ╚══════════════════════════════════════════════════════════════╝
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS analyses(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT NOT NULL,
-        url TEXT NOT NULL,
-        brand TEXT NOT NULL,
-        score REAL NOT NULL,
-        json_data TEXT NOT NULL
-    )""")
-    conn.commit(); conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""CREATE TABLE IF NOT EXISTS analyses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            url TEXT NOT NULL,
+            brand TEXT NOT NULL,
+            score REAL NOT NULL,
+            json_data TEXT NOT NULL
+        )""")
+        conn.commit(); conn.close()
+    except Exception:
+        pass  # Read-only filesystem on Streamlit Cloud — silently skip
 
 def save_analysis(url, brand, score, data):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT INTO analyses(timestamp,url,brand,score,json_data) VALUES(?,?,?,?,?)",
-        (datetime.now().isoformat(), url, brand, score, json.dumps(data, default=str))
-    )
-    conn.commit(); conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "INSERT INTO analyses(timestamp,url,brand,score,json_data) VALUES(?,?,?,?,?)",
+            (datetime.now().isoformat(), url, brand, score, json.dumps(data, default=str))
+        )
+        conn.commit(); conn.close()
+    except Exception:
+        pass  # Read-only filesystem on Streamlit Cloud — silently skip
 
 def load_recent(n=5):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT id,timestamp,url,brand,score FROM analyses ORDER BY timestamp DESC LIMIT ?", (n,)
-    ).fetchall()
-    conn.close(); return rows
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT id,timestamp,url,brand,score FROM analyses ORDER BY timestamp DESC LIMIT ?", (n,)
+        ).fetchall()
+        conn.close(); return rows
+    except Exception:
+        return []
 
 def load_by_id(aid):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT json_data FROM analyses WHERE id=?", (aid,)).fetchone()
-    conn.close()
-    return json.loads(row[0]) if row else None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("SELECT json_data FROM analyses WHERE id=?", (aid,)).fetchone()
+        conn.close()
+        return json.loads(row[0]) if row else None
+    except Exception:
+        return None
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -650,26 +666,23 @@ async def query_gemini(context, prompt: str) -> dict:
             r["response"] = "[Login required — Gemini redirected to Google login]"
             return r
 
+        # Gemini uses rich-textarea with contenteditable div inside
         INPUT_SELS = [
-            'rich-textarea .ql-editor',
-            'rich-textarea div[contenteditable="true"]',
-            'textarea[aria-label]',
-            'div[contenteditable="true"]',
-            '.textarea-container textarea',
-            'textarea',
+            'rich-textarea [contenteditable="true"]',
+            '[contenteditable="true"]',
+            '[role="textbox"]',
+            'rich-textarea',
         ]
-        filled = await _safe_fill(page, INPUT_SELS, prompt, timeout=12000)
-        if not filled:
-            # Some Gemini versions use type instead of fill
-            for sel in INPUT_SELS:
-                try:
-                    el = await page.wait_for_selector(sel, timeout=4000)
-                    await el.click()
-                    await page.keyboard.type(prompt, delay=40)
-                    filled = True
-                    break
-                except Exception:
-                    continue
+        filled = False
+        for sel in INPUT_SELS:
+            try:
+                el = await page.wait_for_selector(sel, timeout=6000)
+                await el.click()
+                await page.keyboard.type(prompt, delay=35)
+                filled = True
+                break
+            except Exception:
+                continue
 
         if not filled:
             r["error"] = "input_not_found"
@@ -677,33 +690,37 @@ async def query_gemini(context, prompt: str) -> dict:
             return r
 
         await page.keyboard.press("Enter")
-        await page.wait_for_timeout(2500)
-
-        RESP_SELS = [
-            'model-response .response-content',
-            'message-content .markdown',
-            '[class*="model-response"]',
-            'response-container',
-            '.conversation-container .response',
-            'div[data-response-id]',
-        ]
-        resp_sel = None
-        for sel in RESP_SELS:
+        # Wait for Gemini to start and finish responding
+        # First wait for spinner to appear, then disappear
+        await page.wait_for_timeout(3000)
+        # Wait up to 30s for response to stabilize — poll body text length
+        prev_len = 0
+        stable_count = 0
+        for _ in range(20):
+            await page.wait_for_timeout(2000)
             try:
-                await page.wait_for_selector(sel, timeout=20000)
-                resp_sel = sel
+                txt = await page.evaluate("document.body.innerText")
+                cur_len = len(txt)
+                if cur_len == prev_len and cur_len > 500:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        break
+                else:
+                    stable_count = 0
+                prev_len = cur_len
+            except Exception:
                 break
-            except Exception:
-                continue
 
-        if resp_sel:
-            r["response"] = await _wait_stream_stop(page, resp_sel, stable_ms=3000, timeout_s=50)
-        else:
-            await page.wait_for_timeout(20000)
-            try:
-                r["response"] = await page.inner_text("main")
-            except Exception:
-                r["response"] = await page.inner_text("body")
+        try:
+            full_text = await page.evaluate("document.body.innerText")
+            # Remove the prompt from the start, take the response portion
+            prompt_idx = full_text.find(prompt)
+            if prompt_idx >= 0:
+                r["response"] = full_text[prompt_idx + len(prompt):].strip()[:3000]
+            else:
+                r["response"] = full_text[-3000:].strip()
+        except Exception as e:
+            r["response"] = f"[Error extracting response: {e}]"
 
         # sources
         try:
@@ -736,70 +753,72 @@ async def query_claude(context, prompt: str) -> dict:
             r["response"] = "[Login required — Claude redirected to login page]"
             return r
 
+        # Claude: use same stable approach as Gemini - type then poll for response
         INPUT_SELS = [
-            'div[contenteditable="true"].ProseMirror',
-            '.ProseMirror',
-            'div[contenteditable="true"][data-placeholder]',
-            'div[contenteditable="true"]',
-            'textarea[placeholder]',
+            '[data-testid="chat-input"]',
+            'div.ProseMirror',
+            '[contenteditable="true"]',
+            '[role="textbox"]',
             'textarea',
         ]
-        filled = await _safe_fill(page, INPUT_SELS, prompt, timeout=12000)
-        if not filled:
-            for sel in INPUT_SELS:
-                try:
-                    el = await page.wait_for_selector(sel, timeout=4000)
-                    await el.click()
-                    await page.keyboard.type(prompt, delay=35)
-                    filled = True
-                    break
-                except Exception:
-                    continue
+        filled = False
+        for sel in INPUT_SELS:
+            try:
+                el = await page.wait_for_selector(sel, timeout=6000)
+                await el.click()
+                await page.keyboard.type(prompt, delay=35)
+                filled = True
+                break
+            except Exception:
+                continue
 
         if not filled:
             r["error"] = "input_not_found"
             r["response"] = "[Could not find Claude input field]"
             return r
 
-        # Claude: press Enter or click send button
+        # Click send button or press Enter
         sent = False
-        for btn_sel in ['button[aria-label="Send message"]', 'button[type="submit"]',
-                        '[data-testid="send-button"]']:
+        for btn_sel in ['button[aria-label="Send message"]', 'button[aria-label="Send"]',
+                        'button[type="submit"]', '[data-testid="send-button"]']:
             try:
-                btn = await page.wait_for_selector(btn_sel, timeout=3000)
+                btn = await page.wait_for_selector(btn_sel, timeout=2000, state="visible")
                 await btn.click()
                 sent = True
                 break
             except Exception:
                 continue
         if not sent:
-            await page.keyboard.press("Enter")
+            await page.keyboard.press("Return")
 
-        await page.wait_for_timeout(2500)
-
-        RESP_SELS = [
-            '[data-testid="bot-message"]',
-            '.font-claude-message',
-            '[class*="assistant"]',
-            '.prose',
-        ]
-        resp_sel = None
-        for sel in RESP_SELS:
+        # Poll for stable response
+        await page.wait_for_timeout(3000)
+        prev_len = 0
+        stable_count = 0
+        for _ in range(25):
+            await page.wait_for_timeout(2000)
             try:
-                await page.wait_for_selector(sel, timeout=20000)
-                resp_sel = sel
+                txt = await page.evaluate("document.body.innerText")
+                cur_len = len(txt)
+                if cur_len == prev_len and cur_len > 500:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        break
+                else:
+                    stable_count = 0
+                prev_len = cur_len
+            except Exception:
                 break
-            except Exception:
-                continue
 
-        if resp_sel:
-            r["response"] = await _wait_stream_stop(page, resp_sel, stable_ms=3000, timeout_s=50)
-        else:
-            await page.wait_for_timeout(20000)
-            try:
-                r["response"] = await page.inner_text("main")
-            except Exception:
-                r["response"] = await page.inner_text("body")
+        try:
+            full_text = await page.evaluate("document.body.innerText")
+            prompt_idx = full_text.find(prompt[:50])
+            if prompt_idx >= 0:
+                r["response"] = full_text[prompt_idx + len(prompt):].strip()[:3000]
+            else:
+                r["response"] = full_text[-3000:].strip()
+        except Exception as e:
+            r["response"] = f"[Error extracting response: {e}]"
 
         try:
             links = await page.eval_on_selector_all(
@@ -897,11 +916,13 @@ async def run_live_queries(
         return []
 
     results = []
-    total   = len(prompts) * 3
+    # ChatGPT is SKIPPED — Cloudflare blocks headless browsers
+    log("⛔ ChatGPT: SKIPPED — Cloudflare bot protection blocks headless browsers")
+    total   = len(prompts) * 2   # only Gemini + Claude
     done    = 0
 
     QUERY_FNS = [
-        ("ChatGPT", query_chatgpt),
+        # ("ChatGPT", query_chatgpt),  # SKIPPED: Cloudflare-blocked in headless mode
         ("Gemini",  query_gemini),
         ("Claude",  query_claude),
     ]
@@ -1151,9 +1172,10 @@ def compute_metrics(parsed: list) -> dict:
         0.20 * own_pct
     ))
 
-    # Per-model
+    # Per-model (iterate actual data, not hardcoded model list)
     per_model = {}
-    for model in MODELS:
+    active_models = list(set(r["model"] for r in parsed))
+    for model in active_models:
         mr = [r for r in parsed if r["model"] == model]
         if not mr: continue
         mt = len(mr)
@@ -1218,12 +1240,13 @@ TEXT_COL = "#e2e8f0"
 MUTED    = "#64748b"
 
 def _base_layout(**kw):
-    return dict(
+    base = dict(
         paper_bgcolor=CARD_BG, plot_bgcolor=CARD_BG,
         font={"color": TEXT_COL, "family": "DM Sans"},
         margin={"l":20,"r":20,"t":44,"b":16},
-        **kw
     )
+    base.update(kw)   # kw overrides defaults — no duplicate key error
+    return base
 
 def chart_gauge(score: float) -> go.Figure:
     _, color, label = score_band(score)
@@ -1252,9 +1275,12 @@ def chart_gauge(score: float) -> go.Figure:
     return fig
 
 def chart_model_bars(per_model: dict) -> go.Figure:
-    models = [m for m in MODELS if m in per_model]
+    # Use whatever models are in per_model (ChatGPT excluded in live mode)
+    models = [m for m in MODELS_ALL if m in per_model]
+    if not models:
+        return None
     vis    = [per_model[m]["visibility_pct"] for m in models]
-    cols   = [MODEL_COLORS[m] for m in models]
+    cols   = [MODEL_COLORS.get(m, "#3b82f6") for m in models]
     fig = go.Figure(go.Bar(
         x=models, y=vis, marker_color=cols,
         text=[f"{v:.0f}%" for v in vis],
@@ -1287,9 +1313,13 @@ def chart_sentiment_pie(pos, neu, neg, model: str) -> go.Figure:
     return fig
 
 def chart_sources_bar(top_domains: list) -> go.Figure:
+    if not top_domains:
+        return None
     top10  = top_domains[:10]
     doms   = [d["domain"] for d in top10]
     counts = [d["count"] for d in top10]
+    if not doms:
+        return None
     fig = go.Figure(go.Bar(
         y=doms, x=counts, orientation="h",
         marker_color="#3b82f6",
@@ -1306,7 +1336,11 @@ def chart_sources_bar(top_domains: list) -> go.Figure:
     return fig
 
 def chart_competitor_bar(top_comps: list) -> go.Figure:
+    if not top_comps:
+        return None
     top8 = top_comps[:8]
+    if not top8:
+        return None
     fig = go.Figure(go.Bar(
         x=[c["brand"] for c in top8],
         y=[c["count"] for c in top8],
@@ -1375,7 +1409,9 @@ def tab_executive(m: dict):
 
         if m.get("per_model"):
             st.markdown("#### 📊 Model Comparison")
-            st.plotly_chart(chart_model_bars(m["per_model"]), use_container_width=True)
+            _fig = chart_model_bars(m["per_model"])
+            if _fig:
+                st.plotly_chart(_fig, use_container_width=True)
 
     st.info("⏰ Point-in-time snapshot — AI responses vary daily. Run regularly to track trends.")
 
@@ -1424,11 +1460,29 @@ def _gen_insights(m: dict) -> list:
 # ── Tab 2: Per-Model Deep Dive ────────────────────────────────────────────────
 def tab_per_model(m: dict):
     brand = m["brand"]
-    for model in MODELS:
-        if model not in m.get("per_model", {}):
-            st.warning(f"No data collected for {model}")
+
+    # ChatGPT skip notice — always shown in live mode context
+    st.info(
+        "⛔ **ChatGPT: Skipped** — Cloudflare bot protection blocks headless browser access. "
+        "Results below are from Gemini and Claude only."
+    )
+
+    per_model_data = m.get("per_model", {})
+    # Show all known models; mark ChatGPT as skipped, others as missing if no data
+    for model in MODELS_ALL:
+        if model == "ChatGPT":
+            with st.expander("⛔ ChatGPT — Skipped (Cloudflare bot protection in headless mode)", expanded=False):
+                st.markdown(
+                    "ChatGPT redirects headless browsers through Cloudflare's bot protection. "
+                    "This is a known limitation of all headless automation tools. "
+                    "No data was collected. Use the mock mode to see simulated ChatGPT results."
+                )
             continue
-        d = m["per_model"][model]
+        if model not in per_model_data:
+            with st.expander(f"⚠️ {model} — No data collected", expanded=False):
+                st.caption("This model was skipped or all queries returned errors.")
+            continue
+        d = per_model_data[model]
         _, mc, _ = score_band(d["visibility_pct"])
 
         with st.expander(
@@ -1497,7 +1551,9 @@ def tab_sources(m: dict):
             lambda d: "⚠️ Yes" if any(c in d.replace("-","") for c in comp_domains) else "—"
         )
         st.dataframe(df, use_container_width=True, hide_index=True)
-        st.plotly_chart(chart_sources_bar(m["top_domains"]), use_container_width=True)
+        _fig_s = chart_sources_bar(m["top_domains"])
+        if _fig_s:
+            st.plotly_chart(_fig_s, use_container_width=True)
     else:
         st.info("No source URLs were extracted from AI responses.")
 
@@ -1510,7 +1566,9 @@ def tab_sources(m: dict):
         with c1:
             st.dataframe(df2, use_container_width=True, hide_index=True)
         with c2:
-            st.plotly_chart(chart_competitor_bar(m["top_comps"]), use_container_width=True)
+            _fig_c = chart_competitor_bar(m["top_comps"])
+            if _fig_c:
+                st.plotly_chart(_fig_c, use_container_width=True)
     else:
         st.info("No competitor brands detected in responses.")
 
@@ -1871,11 +1929,11 @@ def main():
             st.success("🟢 Live mode — real AI browser queries")
             with st.expander("ℹ️ Live mode notes"):
                 st.markdown("""
-                - **ChatGPT** — works without login for free queries
+                - **ChatGPT** — ⛔ SKIPPED (Cloudflare blocks headless browsers)
                 - **Gemini** — may require Google login; will be marked if blocked
-                - **Claude** — supports guest sessions without login
+                - **Claude** — ProseMirror editor; uses `[data-testid="chat-input"]` selector
                 - Runs headless Chromium; each prompt takes 30–60 seconds
-                - Total time: ~5–15 minutes depending on prompt count
+                - Total time: ~3–10 minutes (2 models x prompt count)
                 - Login-wall results are flagged; score computed on available data
                 """)
         else:
