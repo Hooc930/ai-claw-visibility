@@ -1,0 +1,9 @@
+streamlit>=1.30.0
+playwright>=1.40.0
+trafilatura>=1.6.0
+beautifulsoup4>=4.12.0
+pandas>=2.0.0
+plotly>=5.18.0
+textblob>=0.17.0
+httpx>=0.26.0
+pydantic>=2.5.0
