@@ -312,7 +312,7 @@ def crawl_site(url: str, log) -> str:
         log("⚠️  trafilatura not available — skipping crawl")
         return ""
     texts, seen_links = [], set()
-    log(f"🌐 Crawling {url} …")
+    log(f"🌐 Crawling {url} ...")
     try:
         raw = trafilatura.fetch_url(url)
         if raw:
@@ -483,7 +483,7 @@ def analyze_site(url: str, brand_override: str, num_prompts: int, log) -> dict:
     # Try Bedrock for smarter prompts; fall back to templates
     prompts = None
     if HAS_BEDROCK and site_text:
-        log("🤖 Using Bedrock Claude Haiku for prompt generation …")
+        log("🤖 Using Bedrock Claude Haiku for prompt generation ...")
         prompts = bedrock_generate_prompts(
             brand, domain, tagline, products, topics, competitors, num_prompts
         )
@@ -917,7 +917,7 @@ async def run_live_queries(
         async with async_playwright() as pw:
             for model_name, query_fn in QUERY_FNS:
                 log(f"\n{'─'*40}")
-                log(f"🤖 Starting {model_name} browser session …")
+                log(f"🤖 Starting {model_name} browser session ...")
                 browser = None
                 try:
                     browser = await pw.chromium.launch(
@@ -950,7 +950,7 @@ async def run_live_queries(
                         await page_test.close()
 
                     for i, prompt in enumerate(prompts):
-                        log(f"  [{model_name}] {i+1}/{len(prompts)}: {prompt[:65]}…")
+                        log(f"  [{model_name}] {i+1}/{len(prompts)}: {prompt[:65]}...")
                         try:
                             res = await query_fn(context, prompt)
                             res["brand"]       = brand
@@ -965,7 +965,7 @@ async def run_live_queries(
                                 log(f"  ⚠️  Error: {res['error'][:80]}")
                             else:
                                 preview = res["response"][:60].replace("\n"," ")
-                                log(f"  ✅ Got {len(res['response'])} chars: "{preview}…"")
+                                log(f"  OK Got {len(res['response'])} chars: {preview[:60]}")
 
                         except Exception as e:
                             log(f"  ❌ Unexpected error on prompt {i+1}: {e}")
@@ -983,7 +983,7 @@ async def run_live_queries(
                         # Polite delay between prompts
                         if i < len(prompts) - 1:
                             delay = random.uniform(6, 12)
-                            log(f"  ⏳ Waiting {delay:.1f}s …")
+                            log(f"  ⏳ Waiting {delay:.1f}s ...")
                             await asyncio.sleep(delay)
 
                 except Exception as e:
@@ -1009,3 +1009,999 @@ async def run_live_queries(
 
     return results
 
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  STEP C — PARSING ENGINE                                    ║
+# ╚══════════════════════════════════════════════════════════════╝
+def extract_urls(text: str) -> list:
+    pat = re.compile(r'https?://[^\s\)\]\>\"\'<]+(?:[^\s\.\,\)\]\>\"\':<]*[^\s\.\,\)\]\>\"\':<:])')
+    return pat.findall(text)
+
+def url_to_domain(url: str) -> str:
+    try:
+        d = urlparse(url).netloc.lower()
+        return d[4:] if d.startswith("www.") else d
+    except Exception:
+        return ""
+
+def categorize(domain: str) -> str:
+    for k, v in SOURCE_CATEGORIES.items():
+        if k in domain:
+            return v
+    return "Other"
+
+def sentiment_for(text: str, brand: str) -> tuple[str, float]:
+    """TextBlob sentence-level sentiment on brand-mentioning sentences."""
+    if not HAS_TEXTBLOB or not text:
+        return "neutral", 0.5
+    try:
+        blob   = TextBlob(text)
+        bl     = brand.lower()
+        sents  = [s for s in blob.sentences if bl in str(s).lower()]
+        if not sents:
+            return "neutral", 0.5
+        avg = sum(s.sentiment.polarity for s in sents) / len(sents)
+        if avg > 0.08:
+            return "positive", avg
+        if avg < -0.08:
+            return "negative", avg
+        return "neutral", avg
+    except Exception:
+        return "neutral", 0.5
+
+def parse_one(raw: dict) -> dict:
+    brand       = raw.get("brand", "")
+    domain      = raw.get("domain", "")
+    response    = raw.get("response", "")
+    src_urls    = raw.get("sources", [])
+    competitors = raw.get("competitors", [])
+
+    rl = response.lower()
+    bl = brand.lower()
+
+    brand_mentioned = bl in rl or (domain and domain in rl)
+
+    # First-mention position: count distinct "other brands" before brand appears
+    first_pos = 0
+    if brand_mentioned:
+        idx = rl.find(bl)
+        if idx == -1 and domain:
+            idx = rl.find(domain)
+        pre = rl[:idx]
+        GENERIC = ["hubspot","salesforce","notion","monday","asana","slack",
+                   "zoom","shopify","mailchimp","google","microsoft","apple"]
+        comp_set = set(c.lower() for c in competitors) | set(GENERIC)
+        before   = sum(1 for c in comp_set if c != bl and c in pre)
+        first_pos = before + 1      # 1-indexed
+
+    sentiment, sent_score = sentiment_for(response, brand)
+
+    all_urls     = extract_urls(response) + [u for u in src_urls if u.startswith("http")]
+    cited_domains = list(dict.fromkeys(url_to_domain(u) for u in all_urls if url_to_domain(u)))
+
+    # Competitor mentions in response
+    comp_hits = []
+    EXTRA = ["HubSpot","Salesforce","Mailchimp","Shopify","WordPress","Notion",
+             "Monday","Asana","Slack","Google","Microsoft","Apple","Amazon",
+             "Semrush","Ahrefs","Hotjar","Mixpanel","Amplitude","Figma","Canva",
+             "Intercom","Zendesk","Freshdesk","Jira","ClickUp","Linear"]
+    for c in list(competitors) + EXTRA:
+        if c.lower() != bl and c.lower() in rl and c not in comp_hits:
+            comp_hits.append(c)
+    comp_hits = comp_hits[:8]
+
+    own_cited = domain in cited_domains if domain else False
+
+    return {
+        "model":             raw.get("model"),
+        "prompt":            raw.get("prompt"),
+        "response":          response,
+        "mock":              raw.get("mock", True),
+        "error":             raw.get("error"),
+        "brand_mentioned":   brand_mentioned,
+        "first_pos":         first_pos,
+        "sentiment":         sentiment,
+        "sent_score":        sent_score,
+        "cited_domains":     cited_domains,
+        "source_cats":       {d: categorize(d) for d in cited_domains},
+        "comp_mentions":     comp_hits,
+        "own_cited":         own_cited,
+        "brand":             brand,
+        "domain":            domain,
+    }
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  STEP D — METRICS & SCORING                                 ║
+# ╚══════════════════════════════════════════════════════════════╝
+def compute_metrics(parsed: list) -> dict:
+    if not parsed:
+        return {}
+
+    brand  = parsed[0]["brand"]
+    domain = parsed[0]["domain"]
+    total  = len(parsed)
+
+    ment   = [r for r in parsed if r["brand_mentioned"]]
+    vis    = len(ment) / total * 100
+
+    positions = [r["first_pos"] for r in ment if r["first_pos"] > 0]
+    avg_pos   = sum(positions) / len(positions) if positions else 5.0
+
+    sents     = [r["sentiment"] for r in ment]
+    n_pos     = sents.count("positive")
+    n_neu     = sents.count("neutral")
+    n_neg     = sents.count("negative")
+    n_tot     = len(sents)
+    sent_score = (n_pos * 1.0 + n_neu * 0.5) / n_tot if n_tot else 0.5
+
+    own_count = sum(1 for r in parsed if r["own_cited"])
+    own_pct   = own_count / total * 100
+
+    all_cited = []
+    for r in parsed:
+        all_cited.extend(r["cited_domains"])
+    cit_rate = len(all_cited) / total
+
+    # Overall score
+    score = min(100, max(0,
+        0.40 * vis +
+        0.20 * max(0, 100 - avg_pos * 5) +
+        0.20 * sent_score * 100 +
+        0.20 * own_pct
+    ))
+
+    # Per-model
+    per_model = {}
+    for model in MODELS:
+        mr = [r for r in parsed if r["model"] == model]
+        if not mr: continue
+        mt = len(mr)
+        mm = [r for r in mr if r["brand_mentioned"]]
+        mv = len(mm) / mt * 100
+        mp = [r["first_pos"] for r in mm if r["first_pos"] > 0]
+        ma = sum(mp) / len(mp) if mp else 5.0
+        ms = [r["sentiment"] for r in mm]
+        mss = ((ms.count("positive") * 1.0 + ms.count("neutral") * 0.5) / len(ms)) if ms else 0.5
+        mc = []; [mc.extend(r["cited_domains"]) for r in mr]
+        mown = sum(1 for r in mr if r["own_cited"]) / mt * 100
+        per_model[model] = {
+            "total": mt, "mentioned": len(mm), "visibility_pct": mv,
+            "avg_pos": ma, "sent_score": mss, "own_pct": mown,
+            "cit_rate": len(mc)/mt, "cited_domains": mc,
+            "pos": ms.count("positive"), "neu": ms.count("neutral"),
+            "neg": ms.count("negative"), "results": mr,
+        }
+
+    # Top domains & competitors
+    dom_counts  = Counter(all_cited)
+    top_domains = [{"domain": d, "count": c, "category": categorize(d)}
+                   for d, c in dom_counts.most_common(20)]
+
+    all_comps = []
+    for r in parsed: all_comps.extend(r["comp_mentions"])
+    comp_counts = Counter(all_comps)
+    top_comps   = [{"brand": b, "count": c}
+                   for b, c in comp_counts.most_common(10)
+                   if b.lower() != brand.lower()]
+
+    # Login-wall stats
+    login_count = sum(1 for r in parsed if r.get("error") == "login_required")
+    error_count = sum(1 for r in parsed if r.get("error") and r.get("error") != "login_required")
+    mock_count  = sum(1 for r in parsed if r.get("mock"))
+
+    return {
+        "brand": brand, "domain": domain, "total_queries": total,
+        "visibility_pct": vis, "avg_pos": avg_pos, "sent_score": sent_score,
+        "own_pct": own_pct, "cit_rate": cit_rate, "score": score,
+        "n_pos": n_pos, "n_neu": n_neu, "n_neg": n_neg,
+        "per_model": per_model, "top_domains": top_domains,
+        "top_comps": top_comps, "parsed": parsed,
+        "login_count": login_count, "error_count": error_count,
+        "mock_count": mock_count,
+    }
+
+def score_band(s: float) -> tuple[str, str, str]:
+    """Returns (emoji, hex_color, label)."""
+    if s >= 71: return "🟢", "#22c55e", "Strong"
+    if s >= 41: return "🟡", "#f59e0b", "Moderate"
+    return "🔴", "#ef4444", "Critical"
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  CHARTS                                                      ║
+# ╚══════════════════════════════════════════════════════════════╝
+DARK_BG  = "#0a0a0f"
+CARD_BG  = "#111118"
+GRID_COL = "#1e3a5f"
+TEXT_COL = "#e2e8f0"
+MUTED    = "#64748b"
+
+def _base_layout(**kw):
+    return dict(
+        paper_bgcolor=CARD_BG, plot_bgcolor=CARD_BG,
+        font={"color": TEXT_COL, "family": "DM Sans"},
+        margin={"l":20,"r":20,"t":44,"b":16},
+        **kw
+    )
+
+def chart_gauge(score: float) -> go.Figure:
+    _, color, label = score_band(score)
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        domain={"x":[0,1],"y":[0,1]},
+        title={"text": f"Brand Visibility Score — {label}",
+               "font": {"size":15, "color": TEXT_COL}},
+        number={"font": {"size":52, "color": color, "family":"Space Mono"}, "suffix":""},
+        gauge={
+            "axis": {"range":[0,100], "tickwidth":1, "tickcolor":GRID_COL,
+                     "tickfont":{"color": MUTED}},
+            "bar":  {"color": color, "thickness":0.28},
+            "bgcolor": CARD_BG, "borderwidth": 0,
+            "steps": [
+                {"range":[0,40],   "color":"#1f0d0d"},
+                {"range":[40,70],  "color":"#1f1a0d"},
+                {"range":[70,100], "color":"#0d1f0d"},
+            ],
+            "threshold":{"line":{"color":color,"width":3},
+                         "thickness":0.85,"value":score},
+        }
+    ))
+    fig.update_layout(**_base_layout(height=290))
+    return fig
+
+def chart_model_bars(per_model: dict) -> go.Figure:
+    models = [m for m in MODELS if m in per_model]
+    vis    = [per_model[m]["visibility_pct"] for m in models]
+    cols   = [MODEL_COLORS[m] for m in models]
+    fig = go.Figure(go.Bar(
+        x=models, y=vis, marker_color=cols,
+        text=[f"{v:.0f}%" for v in vis],
+        textposition="outside", textfont={"color": TEXT_COL},
+        width=0.45,
+    ))
+    fig.update_layout(
+        **_base_layout(height=270),
+        title={"text":"Visibility % by AI Model","font":{"color":TEXT_COL,"size":13}},
+        xaxis={"tickfont":{"color":TEXT_COL},"gridcolor":GRID_COL},
+        yaxis={"range":[0,115],"tickfont":{"color":TEXT_COL},"gridcolor":GRID_COL},
+    )
+    return fig
+
+def chart_sentiment_pie(pos, neu, neg, model: str) -> go.Figure:
+    mc = MODEL_COLORS.get(model,"#3b82f6")
+    pairs = [("Positive",pos,"#22c55e"),("Neutral",neu,mc),("Negative",neg,"#ef4444")]
+    lbl, val, clr = zip(*[(l,v,c) for l,v,c in pairs if v>0]) if any(v for _,v,_ in pairs) \
+                    else (["No mentions"],[1],[GRID_COL])
+    fig = go.Figure(go.Pie(
+        labels=lbl, values=val, marker_colors=clr,
+        hole=0.5, textfont={"color":TEXT_COL},
+        hovertemplate="%{label}: %{value}<extra></extra>",
+    ))
+    fig.update_layout(
+        **_base_layout(height=220, margin={"l":10,"r":10,"t":20,"b":10}),
+        showlegend=True,
+        legend={"font":{"color":TEXT_COL},"bgcolor":CARD_BG,"x":0.82,"y":0.5},
+    )
+    return fig
+
+def chart_sources_bar(top_domains: list) -> go.Figure:
+    top10  = top_domains[:10]
+    doms   = [d["domain"] for d in top10]
+    counts = [d["count"] for d in top10]
+    fig = go.Figure(go.Bar(
+        y=doms, x=counts, orientation="h",
+        marker_color="#3b82f6",
+        text=counts, textposition="outside",
+        textfont={"color":TEXT_COL},
+    ))
+    fig.update_layout(
+        **_base_layout(height=max(260, len(top10)*34+60)),
+        title={"text":"Top Cited Domains","font":{"color":TEXT_COL,"size":13}},
+        xaxis={"tickfont":{"color":TEXT_COL},"gridcolor":GRID_COL},
+        yaxis={"tickfont":{"color":TEXT_COL,"size":11},"gridcolor":GRID_COL,
+               "autorange":"reversed"},
+    )
+    return fig
+
+def chart_competitor_bar(top_comps: list) -> go.Figure:
+    top8 = top_comps[:8]
+    fig = go.Figure(go.Bar(
+        x=[c["brand"] for c in top8],
+        y=[c["count"] for c in top8],
+        marker_color="#ef4444",
+        text=[c["count"] for c in top8],
+        textposition="outside", textfont={"color":TEXT_COL},
+        width=0.5,
+    ))
+    fig.update_layout(
+        **_base_layout(height=260),
+        title={"text":"Competitor Mentions in AI Responses","font":{"color":TEXT_COL,"size":13}},
+        xaxis={"tickfont":{"color":TEXT_COL}},
+        yaxis={"tickfont":{"color":TEXT_COL},"gridcolor":GRID_COL},
+    )
+    return fig
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  REPORT TABS                                                 ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+# ── Tab 1: Executive Summary ──────────────────────────────────────────────────
+def tab_executive(m: dict):
+    brand = m["brand"]
+    score = m["score"]
+    emoji, color, label = score_band(score)
+
+    col_gauge, col_insight = st.columns([1,1], gap="large")
+
+    with col_gauge:
+        st.plotly_chart(chart_gauge(score), use_container_width=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            delta_vis = f"+{m['visibility_pct']-50:.0f}%" if m['visibility_pct']>50 else f"{m['visibility_pct']-50:.0f}%"
+            st.metric("Visibility", f"{m['visibility_pct']:.0f}%", delta=delta_vis,
+                      help="% of AI responses that mention the brand")
+            st.metric("Avg Position", f"#{m['avg_pos']:.1f}",
+                      help="Average rank of first brand mention (1=first mentioned brand)")
+        with c2:
+            st.metric("Sentiment", f"{m['sent_score']*100:.0f}/100",
+                      help="Weighted sentiment score (positive=100, neutral=50, negative=0)")
+            st.metric("Own Site Cited", f"{m['own_pct']:.0f}%",
+                      help="% of responses that include a link to your domain")
+
+        # Data quality callout
+        if m.get("login_count",0) > 0 or m.get("mock_count",0) > 0:
+            n_live = m["total_queries"] - m.get("mock_count",0) - m.get("login_count",0)
+            n_wall = m.get("login_count",0)
+            n_mock = m.get("mock_count",0)
+            wall_part = f' · <b style="color:#f59e0b">{n_wall} login-wall</b>' if n_wall else ""
+            mock_part = f' · <b style="color:#64748b">{n_mock} mock</b>' if n_mock else ""
+            dq_html = (
+                '<div style="background:#0d1729;border:1px solid #1e3a5f;border-radius:8px;'
+                'padding:.7rem .9rem;font-size:.78rem;color:#94a3b8;margin-top:.5rem;">'
+                f'Data: <b style="color:#22c55e">{n_live} live</b>'
+                f'{wall_part}{mock_part}'
+                f' out of {m["total_queries"]} queries</div>'
+            )
+            st.markdown(dq_html, unsafe_allow_html=True)
+
+    with col_insight:
+        st.markdown("#### 💡 Top Insights")
+        insights = _gen_insights(m)
+        for ins in insights:
+            st.markdown(f'<div class="insight">{ins}</div>', unsafe_allow_html=True)
+
+        if m.get("per_model"):
+            st.markdown("#### 📊 Model Comparison")
+            st.plotly_chart(chart_model_bars(m["per_model"]), use_container_width=True)
+
+    st.info("⏰ Point-in-time snapshot — AI responses vary daily. Run regularly to track trends.")
+
+
+def _gen_insights(m: dict) -> list:
+    brand = m["brand"]
+    vis   = m["visibility_pct"]
+    score = m["score"]
+    out   = []
+
+    if m.get("per_model"):
+        best  = max(m["per_model"], key=lambda x: m["per_model"][x]["visibility_pct"])
+        worst = min(m["per_model"], key=lambda x: m["per_model"][x]["visibility_pct"])
+        bv    = m["per_model"][best]["visibility_pct"]
+        wv    = m["per_model"][worst]["visibility_pct"]
+
+    # Visibility insight
+    if vis >= 70:
+        out.append(f"✅ <b>Strong AI presence</b> — {brand} appears in {vis:.0f}% of AI responses, above average.")
+    elif vis >= 40:
+        out.append(f"⚡ <b>Moderate visibility</b> — {brand} appears in {vis:.0f}% of AI responses. Real growth opportunity.")
+    else:
+        out.append(f"🚨 <b>Low AI visibility</b> — {brand} appears in only {vis:.0f}% of responses. Immediate action needed.")
+
+    # Model spread insight
+    if m.get("per_model") and len(m["per_model"]) > 1:
+        if bv - wv > 25:
+            out.append(f"📊 <b>Uneven model coverage</b> — {best} shows {bv:.0f}% vs {worst} only {wv:.0f}%. "
+                       f"Optimise for {worst} specifically.")
+        else:
+            out.append(f"📊 <b>Consistent across models</b> — {best} leads at {bv:.0f}%, {worst} trails at {wv:.0f}%. "
+                       f"Solid baseline across all three AI platforms.")
+
+    # Competitor / own-site insight
+    if m["top_comps"]:
+        tc = m["top_comps"][0]
+        out.append(f"🏆 <b>Top AI competitor: {tc['brand']}</b> — mentioned {tc['count']}× across responses. "
+                   f"Create a '{brand} vs {tc['brand']}' comparison page to capture this traffic.")
+    elif m["own_pct"] < 15:
+        out.append(f"📎 <b>Own domain rarely cited</b> — only {m['own_pct']:.0f}% of responses include a link to {m['domain']}. "
+                   f"Improve domain authority and publish citation-worthy content.")
+
+    return out[:3]
+
+
+# ── Tab 2: Per-Model Deep Dive ────────────────────────────────────────────────
+def tab_per_model(m: dict):
+    brand = m["brand"]
+    for model in MODELS:
+        if model not in m.get("per_model", {}):
+            st.warning(f"No data collected for {model}")
+            continue
+        d = m["per_model"][model]
+        _, mc, _ = score_band(d["visibility_pct"])
+
+        with st.expander(
+            f"🤖 {model}  ·  {d['visibility_pct']:.0f}% Visibility  ·  "
+            f"{d['mentioned']}/{d['total']} mentions",
+            expanded=True
+        ):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Visibility", f"{d['visibility_pct']:.0f}%")
+            c2.metric("Avg Position", f"#{d['avg_pos']:.1f}")
+            c3.metric("Sentiment", f"{d['sent_score']*100:.0f}/100")
+            c4.metric("Own Site", f"{d['own_pct']:.0f}%")
+
+            col_pie, col_src = st.columns([1,1])
+            with col_pie:
+                st.plotly_chart(chart_sentiment_pie(d["pos"],d["neu"],d["neg"],model),
+                                use_container_width=True)
+            with col_src:
+                st.markdown("**Top Cited Sources**")
+                dc = Counter(d["cited_domains"])
+                if dc:
+                    df_s = pd.DataFrame(
+                        [{"Domain":dom,"Cited":cnt,"Category":categorize(dom)}
+                         for dom,cnt in dc.most_common(6)]
+                    )
+                    st.dataframe(df_s, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("No source URLs extracted")
+
+            # Example wins / losses
+            results = d.get("results", [])
+            win  = next((r for r in results if r["brand_mentioned"] and not r.get("error")), None)
+            lose = next((r for r in results if not r["brand_mentioned"] and not r.get("error")), None)
+
+            col_w, col_l = st.columns(2)
+            with col_w:
+                st.markdown("**✅ Winning prompt** *(brand mentioned)*")
+                if win:
+                    st.caption(f"Prompt: _{win['prompt']}_")
+                    badge = "🟡 Mock" if win.get("mock") else "🟢 Live"
+                    st.caption(badge)
+                    st.text_area("Response", win["response"][:700]+"...",
+                                 height=160, key=f"win_{model}", disabled=True)
+                else:
+                    st.caption("None found")
+            with col_l:
+                st.markdown("**❌ Losing prompt** *(brand NOT mentioned)*")
+                if lose:
+                    st.caption(f"Prompt: _{lose['prompt']}_")
+                    badge = "🟡 Mock" if lose.get("mock") else "🟢 Live"
+                    st.caption(badge)
+                    st.text_area("Response", lose["response"][:700]+"...",
+                                 height=160, key=f"lose_{model}", disabled=True)
+                else:
+                    st.caption("Brand mentioned in all responses! 🎉")
+
+
+# ── Tab 3: Sources & Citations ────────────────────────────────────────────────
+def tab_sources(m: dict):
+    st.markdown("### 🔗 Cited Sources Across All Responses")
+    if m["top_domains"]:
+        df = pd.DataFrame(m["top_domains"])
+        df.columns = ["Domain","Times Cited","Category"]
+        comp_domains = {c["brand"].lower().replace(" ","") for c in m["top_comps"]}
+        df["Competitor?"] = df["Domain"].apply(
+            lambda d: "⚠️ Yes" if any(c in d.replace("-","") for c in comp_domains) else "—"
+        )
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.plotly_chart(chart_sources_bar(m["top_domains"]), use_container_width=True)
+    else:
+        st.info("No source URLs were extracted from AI responses.")
+
+    st.markdown("### 🏆 Competitor Brand Frequency")
+    if m["top_comps"]:
+        df2 = pd.DataFrame(m["top_comps"])
+        df2.columns = ["Brand","Mentions"]
+        df2["Mention Rate"] = (df2["Mentions"] / m["total_queries"] * 100).apply(lambda x: f"{x:.0f}%")
+        c1, c2 = st.columns([1,1])
+        with c1:
+            st.dataframe(df2, use_container_width=True, hide_index=True)
+        with c2:
+            st.plotly_chart(chart_competitor_bar(m["top_comps"]), use_container_width=True)
+    else:
+        st.info("No competitor brands detected in responses.")
+
+
+# ── Tab 4: Traffic & Visits ───────────────────────────────────────────────────
+def tab_traffic(m: dict):
+    vis   = m["visibility_pct"]
+    brand = m["brand"]
+    est   = int(vis / 100 * 50_000 * 0.08)
+
+    st.markdown("### 🚀 Estimated AI-Referred Traffic")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Est. Monthly Visits", f"{est:,}", help="Visibility% × 50K AI queries/mo × 8% CTR")
+    c2.metric("AI Visibility Rate", f"{vis:.0f}%")
+    c3.metric("Annual Estimate", f"{est*12:,}")
+
+    st.markdown("""
+    <div class="card" style="margin-top:.8rem;">
+    <div class="card-title">📐 Methodology</div>
+    <p style="color:#94a3b8;font-size:.88rem;line-height:1.7;margin:0;">
+    <b>Formula:</b> Visibility% × 50,000 (estimated monthly AI-assisted searches in your category) × 8% (avg click-through from AI answer to source site)<br>
+    <b>Note:</b> Estimates only. Real traffic depends on category volume, response quality, and whether your brand appears with a clickable link.
+    </p></div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("### 📈 Per-Model Traffic Breakdown")
+    if m.get("per_model"):
+        cols = st.columns(len(m["per_model"]))
+        for i,(model,d) in enumerate(m["per_model"].items()):
+            mt = int(d["visibility_pct"]/100 * 50_000 * 0.08)
+            cols[i].metric(f"{model}", f"{mt:,}/mo", delta=f"{d['visibility_pct']:.0f}% vis")
+
+    with st.expander("📋 GA4 Setup Guide: Track AI Chat Referrals", expanded=False):
+        st.markdown(f"""
+### Tracking AI-Referred Traffic in Google Analytics 4
+
+#### Step 1 — Custom Channel Group "AI Chat"
+**Admin → Data Display → Channel Groups → New group**
+
+Add these conditions (session source **contains**):
+| Source | AI Platform |
+|--------|-------------|
+| `chatgpt.com` | ChatGPT |
+| `claude.ai` | Claude |
+| `gemini.google.com` | Gemini |
+| `perplexity.ai` | Perplexity |
+| `copilot.microsoft.com` | Copilot |
+
+#### Step 2 — UTM-tag any links you publish
+```
+https://{m['domain']}?utm_source=ai-chat&utm_medium=organic&utm_campaign=ai-visibility
+```
+
+#### Step 3 — Check referrer traffic today
+1. GA4 → **Reports → Acquisition → Traffic Acquisition**
+2. Set primary dimension to **Session source / medium**
+3. Filter: source contains `chatgpt.com` OR `claude.ai` OR `gemini.google.com`
+4. Check **Realtime** for live AI-referred visitors
+
+#### Step 4 — Set an Alert
+GA4 → **Admin → Insights & Alerts** → Create alert when AI channel sessions > threshold
+
+> **Attribution note:** Many AI-referred visits appear as "direct" traffic because some
+> AI interfaces strip referrer headers. UTM parameters are essential for accurate tracking.
+        """)
+
+
+# ── Tab 5: Recommendations ────────────────────────────────────────────────────
+def tab_recommendations(m: dict):
+    brand = m["brand"]
+    score = m["score"]
+    vis   = m["visibility_pct"]
+    emoji, color, label = score_band(score)
+
+    if score < 40:
+        st.error(f"🚨 **Critical — {brand} is nearly invisible to AI.**  Score: {score:.0f}/100")
+    elif score < 70:
+        st.warning(f"⚡ **Moderate visibility** — room to grow.  Score: {score:.0f}/100")
+    else:
+        st.success(f"✅ **Strong AI presence** — keep it up.  Score: {score:.0f}/100")
+
+    comp_name = m["top_comps"][0]["brand"] if m["top_comps"] else "competitors"
+    ed_sites  = [d["domain"] for d in m["top_domains"] if d["category"]=="Editorial"][:3]
+    rev_sites = [d["domain"] for d in m["top_domains"] if d["category"]=="Review/UGC"][:3]
+
+    recs = [
+        {
+            "pri":"high" if score<50 else "medium",
+            "title":f"Build review presence on G2, Trustpilot & Capterra",
+            "body":(
+                f"Review platforms are the #1 most cited category in AI responses. "
+                f"Getting {brand} listed with 50+ verified reviews on G2, Trustpilot, "
+                f"and Capterra directly increases how often AI models mention you."
+            ),
+            "effort":"Medium","impact":"Very High",
+        },
+        {
+            "pri":"high" if vis<50 else "medium",
+            "title":f"Create '{brand} vs {comp_name}' comparison page",
+            "body":(
+                f"{comp_name} appears frequently in AI responses about your category. "
+                f"A dedicated comparison page (/vs/{comp_name.lower().replace(' ','-')}) "
+                f"is commonly cited by AI when users ask about alternatives. "
+                f"Include a feature matrix, pricing table, and use-case breakdown."
+            ),
+            "effort":"Low","impact":"High",
+        },
+        {
+            "pri":"medium",
+            "title":f"Get featured on {ed_sites[0] if ed_sites else 'editorial sites'}",
+            "body":(
+                f"AI models heavily cite editorial sources like "
+                f"{', '.join(ed_sites) if ed_sites else 'TechCrunch, Wired, Forbes'}. "
+                f"Pitch product reviews, guest posts, or expert quotes. "
+                f"A single feature on a top editorial site can meaningfully lift your score."
+            ),
+            "effort":"High","impact":"Very High",
+        },
+        {
+            "pri":"medium",
+            "title":"Add structured schema markup (JSON-LD)",
+            "body":(
+                f"Add Organization, Product, FAQ, and HowTo JSON-LD schema to your site. "
+                f"This helps AI models understand {brand}'s identity, products, and use cases "
+                f"more precisely — improving both mention accuracy and sentiment."
+            ),
+            "effort":"Low","impact":"Medium",
+        },
+        {
+            "pri":"medium" if score>40 else "high",
+            "title":"Publish high-intent answer pages",
+            "body":(
+                f"Create pages that directly answer: 'What is {brand}?', "
+                f"'How does {brand} work?', '{brand} pricing', '{brand} alternatives'. "
+                f"AI models surface well-structured answer content from authoritative domains."
+            ),
+            "effort":"Medium","impact":"High",
+        },
+        {
+            "pri":"low",
+            "title":f"Pursue a Wikipedia article for {brand}",
+            "body":(
+                f"Wikipedia is cited in nearly every AI response set we've seen. "
+                f"If {brand} meets notability criteria, a Wikipedia article provides "
+                f"a persistent, high-trust signal for all AI systems."
+            ),
+            "effort":"Medium","impact":"High",
+        },
+        {
+            "pri":"low",
+            "title":f"Monitor AI visibility weekly",
+            "body":(
+                f"AI responses change frequently as models are updated. "
+                f"Run this tool at least weekly for {brand} to detect drops early. "
+                f"Set a target score of {min(score+15,95):.0f} and track progress."
+            ),
+            "effort":"Low","impact":"Ongoing",
+        },
+    ]
+
+    PRI_STYLES = {"high":"rec-high","medium":"rec-medium","low":"rec-low"}
+    PRI_LABELS = {"high":"🔴 High Priority","medium":"🟡 Medium","low":"🟢 Nice-to-Have"}
+
+    for rec in recs[:6]:
+        cls = PRI_STYLES.get(rec["pri"],"rec-medium")
+        with st.expander(f"{PRI_LABELS[rec['pri']]}  |  {rec['title']}"):
+            col_body, col_meta = st.columns([3,1])
+            with col_body:
+                st.markdown(f'<div class="insight {cls}" style="margin:0;">{rec["body"]}</div>',
+                            unsafe_allow_html=True)
+            with col_meta:
+                st.metric("Effort",rec["effort"])
+                st.metric("Impact",rec["impact"])
+
+
+# ── Tab 6: Raw Data ───────────────────────────────────────────────────────────
+def tab_raw(m: dict):
+    parsed = m.get("parsed",[])
+    if not parsed:
+        st.info("No data"); return
+
+    st.markdown(f"### 📋 All {len(parsed)} Responses")
+    rows = []
+    for r in parsed:
+        rows.append({
+            "Model":             r["model"],
+            "Prompt":            r["prompt"],
+            "Mentioned":         "✅" if r["brand_mentioned"] else "❌",
+            "Position":          r["first_pos"] if r["brand_mentioned"] else "—",
+            "Sentiment":         r["sentiment"],
+            "Sent Score":        f"{r['sent_score']:.2f}",
+            "Sources":           len(r["cited_domains"]),
+            "Own Site":          "✅" if r["own_cited"] else "❌",
+            "Competitors":       ", ".join(r["comp_mentions"][:3]) or "—",
+            "Data Type":         "🟡 Mock" if r.get("mock") else (
+                                 "⚠️ Login" if r.get("error")=="login_required" else "🟢 Live"),
+            "Response Preview":  r["response"][:120].replace("\n"," ")+"...",
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    with c1:
+        st.download_button("📥 Export CSV", df.to_csv(index=False),
+            file_name=f"aiclaw_{m['brand']}_{ts}.csv", mime="text/csv")
+    with c2:
+        export = [{"model":r["model"],"prompt":r["prompt"],"response":r["response"],
+                   "brand_mentioned":r["brand_mentioned"],"sentiment":r["sentiment"],
+                   "cited_domains":r["cited_domains"],"competitors":r["comp_mentions"]}
+                  for r in parsed]
+        st.download_button("📥 Export JSON", json.dumps(export,indent=2),
+            file_name=f"aiclaw_{m['brand']}_{ts}.json", mime="application/json")
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  ANALYSIS RUNNER (sync wrapper)                             ║
+# ╚══════════════════════════════════════════════════════════════╝
+def run_analysis(url: str, brand_override: str, num_prompts: int,
+                 use_browser: bool, log_lines: list,
+                 progress_ph, status_ph) -> tuple[dict,dict]:
+
+    def log(msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        log_lines.append(f"[{ts}] {msg}")
+        html = "<br>".join(log_lines[-22:])
+        status_ph.markdown(f'<div class="log-box">{html}</div>', unsafe_allow_html=True)
+
+    def prog(v: float):
+        progress_ph.progress(min(v, 1.0))
+
+    # ── Step A ──
+    prog(0.02)
+    log("━━━ STEP A: Site Intelligence ━━━")
+    intel = analyze_site(url, brand_override, num_prompts, log)
+    brand       = intel["brand"]
+    domain      = intel["domain"]
+    prompts     = intel["prompts"]
+    competitors = intel["competitors"]
+    prog(0.08)
+
+    # ── Step B ──
+    raw_results = []
+    log("━━━ STEP B: AI Model Queries ━━━")
+
+    if use_browser and HAS_PLAYWRIGHT:
+        log("🌐 Live browser mode — querying real AI UIs ...")
+        log(f"⚠️  This takes ~{len(prompts)*3//6 + 3}–{len(prompts)*3//4 + 5} minutes. Please wait.")
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            raw_results = loop.run_until_complete(
+                run_live_queries(prompts, brand, domain, competitors, prog, log)
+            )
+            loop.close()
+        except Exception as e:
+            log(f"❌ Live query error: {e}")
+            raw_results = []
+
+        # Check if we got useful results; fall back if all errored
+        live_ok = [r for r in raw_results if not r.get("error")]
+        if not live_ok:
+            log("⚠️  All live queries failed — falling back to mock mode")
+            raw_results = []
+    else:
+        if not use_browser:
+            log("🎭 Mock mode — generating simulated responses ...")
+        elif not HAS_PLAYWRIGHT:
+            log("⚠️  Playwright not installed — using mock mode")
+
+    if not raw_results:
+        for model in MODELS:
+            for prompt in prompts:
+                r = mock_response(model, prompt, brand, domain, competitors)
+                r.update({"brand": brand, "domain": domain, "competitors": competitors})
+                raw_results.append(r)
+        prog(0.7)
+        log(f"✅ Generated {len(raw_results)} mock responses")
+
+    # ── Step C ──
+    log("━━━ STEP C: Parsing & Sentiment ━━━")
+    parsed = [parse_one(r) for r in raw_results]
+    prog(0.88)
+
+    # ── Step D ──
+    log("━━━ STEP D: Scoring ━━━")
+    metrics = compute_metrics(parsed)
+    prog(1.0)
+
+    emoji, _, label = score_band(metrics["score"])
+    log(f"✅ Done! Score: {metrics['score']:.0f}/100 ({emoji} {label})")
+    return metrics, intel
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  MAIN UI                                                     ║
+# ╚══════════════════════════════════════════════════════════════╝
+def main():
+    init_db()
+    st.markdown(CSS, unsafe_allow_html=True)
+
+    # ── Hero ──────────────────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="hero">
+        <div class="hero-claw">⚡</div>
+        <div>
+            <div class="hero-logo">AI CLAW</div>
+            <div class="hero-sub">Brand Visibility Analyzer · Real Browser Automation</div>
+        </div>
+        <div class="hero-badge">🌐 No API Keys Required</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### ⚙️ Analysis Settings")
+
+        # No-API-key callout
+        st.markdown("""
+        <div class="sb-note">
+        🌐 <b>No API keys needed</b><br>
+        This tool uses real browser automation to visit ChatGPT, Gemini, and Claude — 
+        exactly like a human user would. Zero API keys required.
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("---")
+        url = st.text_input("🌐 Website URL *", placeholder="https://yourcompany.com")
+        brand_input = st.text_input(
+            "🏷️ Brand Name(s)",
+            placeholder="Auto-detected from domain if blank",
+        )
+        country = st.selectbox(
+            "🌍 Target Country",
+            list(COUNTRIES.keys()),
+            format_func=lambda k: f"{k} — {COUNTRIES[k]}",
+        )
+        num_prompts = st.slider("📝 Prompts per model", 5, 20, 12)
+
+        st.markdown("---")
+        st.markdown("#### 🤖 Query Mode")
+
+        browser_ok   = HAS_PLAYWRIGHT
+        browser_help = (
+            "Launches headless Chromium to visit chatgpt.com, gemini.google.com, and claude.ai. "
+            "Real responses — no API. May hit login walls on Claude/Gemini."
+            if browser_ok else
+            "⚠️ Playwright not installed. Install it to enable live browser mode."
+        )
+        use_browser = st.toggle(
+            "🌐 Live Browser Scraping",
+            value=False,
+            disabled=not browser_ok,
+            help=browser_help,
+        )
+
+        if use_browser:
+            st.success("🟢 Live mode — real AI browser queries")
+            with st.expander("ℹ️ Live mode notes"):
+                st.markdown("""
+                - **ChatGPT** — works without login for free queries
+                - **Gemini** — may require Google login; will be marked if blocked
+                - **Claude** — supports guest sessions without login
+                - Runs headless Chromium; each prompt takes 30–60 seconds
+                - Total time: ~5–15 minutes depending on prompt count
+                - Login-wall results are flagged; score computed on available data
+                """)
+        else:
+            st.info("🎭 Mock mode — instant demo with simulated responses")
+
+        st.markdown("---")
+        run_btn = st.button(
+            "🔍 Run AI Visibility Analysis",
+            use_container_width=True, type="primary"
+        )
+
+        st.markdown("---")
+        st.markdown("#### 📂 Previous Analyses")
+        recent = load_recent(5)
+        if recent:
+            opts = {"— New Analysis —": None}
+            for row in recent:
+                label = f"[{row[1][:10]}] {row[3]} — {row[4]:.0f}/100"
+                opts[label] = row[0]
+            sel = st.selectbox("Load", list(opts.keys()))
+            if sel != "— New Analysis —" and st.button("📂 Load"):
+                data = load_by_id(opts[sel])
+                if data:
+                    st.session_state["metrics"] = data.get("metrics")
+                    st.session_state["intel"]   = data.get("intel")
+                    st.success("✅ Loaded")
+                    st.rerun()
+        else:
+            st.caption("No saved analyses yet")
+
+    # ── Run ───────────────────────────────────────────────────────────────────
+    if run_btn:
+        if not url.strip():
+            st.error("❌ Please enter a website URL"); st.stop()
+        st.session_state.pop("metrics", None)
+        st.session_state.pop("intel",   None)
+
+        st.markdown("### 🔄 Analysis in progress ...")
+        prog_ph   = st.progress(0)
+        status_ph = st.empty()
+        log_lines = []
+
+        with st.spinner(""):
+            try:
+                metrics, intel = run_analysis(
+                    url.strip(), brand_input.strip(), num_prompts,
+                    use_browser, log_lines, prog_ph, status_ph
+                )
+                st.session_state["metrics"] = metrics
+                st.session_state["intel"]   = intel
+                save_analysis(url, metrics["brand"], metrics["score"],
+                              {"metrics": metrics, "intel": intel})
+                if metrics["score"] > 70:
+                    st.balloons()
+                st.success(f"✅ Complete — Score: {metrics['score']:.0f}/100")
+                time.sleep(0.4)
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Analysis failed: {e}")
+                st.code(traceback.format_exc())
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    metrics = st.session_state.get("metrics")
+    intel   = st.session_state.get("intel")
+
+    if metrics:
+        brand = metrics["brand"]
+        score = metrics["score"]
+        emoji, color, label = score_band(score)
+
+        # Prompts expander
+        if intel and intel.get("prompts"):
+            with st.expander(f"📝 {len(intel['prompts'])} prompts used in analysis", expanded=False):
+                for i, p in enumerate(intel["prompts"], 1):
+                    st.markdown(f"**{i}.** {p}")
+
+        # Tabs
+        t1,t2,t3,t4,t5,t6 = st.tabs([
+            "📊 Executive Summary",
+            "🤖 Per-Model Deep Dive",
+            "🔗 Sources & Citations",
+            "🚀 Traffic & Visits",
+            "💡 Recommendations",
+            "📋 Raw Data",
+        ])
+        with t1: tab_executive(metrics)
+        with t2: tab_per_model(metrics)
+        with t3: tab_sources(metrics)
+        with t4: tab_traffic(metrics)
+        with t5: tab_recommendations(metrics)
+        with t6: tab_raw(metrics)
+
+    else:
+        # Welcome / empty state
+        st.markdown("""
+        <div class="empty-state">
+            <div class="empty-icon">⚡</div>
+            <div class="empty-title">Discover how AI models talk about your brand</div>
+            <div class="empty-sub">
+                AI Claw visits ChatGPT, Gemini, and Claude using real browser automation —
+                exactly like a human user — and measures how often your brand is mentioned,
+                at what position, with what sentiment, and alongside which competitors.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        c1,c2,c3 = st.columns(3)
+        feats = [
+            ("📊","Visibility Score","0–100 composite metric: mention rate, position, sentiment & citation strength."),
+            ("🌐","Real Browser Data","Playwright visits actual AI chat UIs. No API. What real users see."),
+            ("💡","Action Plan","Personalised recommendations to boost your AI presence, ranked by impact."),
+        ]
+        for col,(icon,title,desc) in zip([c1,c2,c3],feats):
+            with col:
+                st.markdown(f"""
+                <div class="feature-card">
+                    <div class="feature-icon">{icon}</div>
+                    <div class="feature-title">{title}</div>
+                    <div class="feature-desc">{desc}</div>
+                </div>""", unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="empty-hint">
+            ← Enter your website URL in the sidebar and click <b>🔍 Run AI Visibility Analysis</b>
+        </div>""", unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    main()
