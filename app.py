@@ -690,35 +690,81 @@ async def query_gemini(context, prompt: str) -> dict:
             return r
 
         await page.keyboard.press("Enter")
-        # Wait for Gemini to start and finish responding
-        # First wait for spinner to appear, then disappear
-        await page.wait_for_timeout(3000)
-        # Wait up to 30s for response to stabilize — poll body text length
+        # Wait for Gemini to start generating — look for response content appearing
+        await page.wait_for_timeout(4000)
+        # Poll until response content grows and then stabilizes (Gemini streams)
         prev_len = 0
         stable_count = 0
-        for _ in range(20):
+        for _ in range(30):   # up to 60s total
             await page.wait_for_timeout(2000)
             try:
-                txt = await page.evaluate("document.body.innerText")
-                cur_len = len(txt)
-                if cur_len == prev_len and cur_len > 500:
+                # Get only the model response text, not the full page
+                resp_text = await page.evaluate("""
+                    () => {
+                        // Try to get model response elements specifically
+                        const selectors = [
+                            'model-response',
+                            '[data-response-index]',
+                            '.response-content',
+                            'message-content'
+                        ];
+                        for (const sel of selectors) {
+                            const els = document.querySelectorAll(sel);
+                            if (els.length > 0) {
+                                return Array.from(els).map(e => e.innerText).join('\\n');
+                            }
+                        }
+                        // Fallback: get body text
+                        return document.body.innerText;
+                    }
+                """)
+                cur_len = len(resp_text)
+                if cur_len > 300 and cur_len == prev_len:
                     stable_count += 1
                     if stable_count >= 2:
                         break
-                else:
+                elif cur_len > prev_len:
                     stable_count = 0
                 prev_len = cur_len
             except Exception:
                 break
 
         try:
-            full_text = await page.evaluate("document.body.innerText")
-            # Remove the prompt from the start, take the response portion
-            prompt_idx = full_text.find(prompt)
+            # Extract using targeted selectors first, fall back to body text parsing
+            response_text = await page.evaluate("""
+                () => {
+                    const selectors = ['model-response', '[data-response-index]', '.response-content'];
+                    for (const sel of selectors) {
+                        const els = document.querySelectorAll(sel);
+                        if (els.length > 0) {
+                            const text = Array.from(els).map(e => e.innerText).join('\\n').trim();
+                            if (text.length > 100) return text;
+                        }
+                    }
+                    // Fall back: body text after the prompt
+                    return document.body.innerText;
+                }
+            """)
+            # If we got body text, strip out the UI chrome and get just the response
+            if len(response_text) < 200:
+                # Wait more and try again
+                await page.wait_for_timeout(8000)
+                response_text = await page.evaluate("document.body.innerText")
+
+            # Extract response part (after the prompt)
+            prompt_idx = response_text.find(prompt[:40])
             if prompt_idx >= 0:
-                r["response"] = full_text[prompt_idx + len(prompt):].strip()[:3000]
+                r["response"] = response_text[prompt_idx + len(prompt):].strip()[:4000]
             else:
-                r["response"] = full_text[-3000:].strip()
+                # Take last substantial chunk
+                r["response"] = response_text.strip()[-4000:]
+
+            # Filter out UI boilerplate
+            boilerplate = ["Sign in", "About Gemini", "Gemini App", "For Business",
+                          "Gemini is AI and can make mistakes", "Opens in a new window"]
+            for bp in boilerplate:
+                r["response"] = r["response"].replace(bp, "").strip()
+
         except Exception as e:
             r["response"] = f"[Error extracting response: {e}]"
 
@@ -1828,11 +1874,13 @@ def run_analysis(url: str, brand_override: str, num_prompts: int,
             log(f"❌ Live query error: {e}")
             raw_results = []
 
-        # Check if we got useful results; fall back if all errored
-        live_ok = [r for r in raw_results if not r.get("error")]
+        # Only fall back to mock if we got ZERO results at all
+        live_ok = [r for r in raw_results if r.get("response") and len(r.get("response","")) > 50]
         if not live_ok:
-            log("⚠️  All live queries failed — falling back to mock mode")
+            log("⚠️  All live queries returned empty — falling back to mock mode")
             raw_results = []
+        else:
+            log(f"✅ Got {len(live_ok)} real responses from live browser scraping")
     else:
         if not use_browser:
             log("🎭 Mock mode — generating simulated responses ...")
