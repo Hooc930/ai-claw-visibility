@@ -51,19 +51,19 @@ except ImportError:
 # ── Constants ─────────────────────────────────────────────────────────────────
 DB_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyses.db")
 MODELS         = ["Gemini", "Claude"]       # ChatGPT skipped — Cloudflare blocks headless
-MODELS_ALL     = ["ChatGPT", "Gemini", "Claude"]  # full list for display/charts
+MODELS_ALL     = ["Perplexity", "Gemini", "Claude"]  # full list for display/charts
 CHATGPT_SKIP   = True
 CHATGPT_REASON = "Cloudflare bot protection blocks headless browsers"
 COUNTRIES = {"US": "United States", "UK": "United Kingdom", "DE": "Germany",
              "FR": "France", "IL": "Israel"}
 
 MODEL_URLS = {
-    "ChatGPT": "https://chatgpt.com/",
+    "Perplexity": "https://chatgpt.com/",
     "Gemini":  "https://gemini.google.com/app",
     "Claude":  "https://claude.ai/new",
 }
 
-MODEL_COLORS = {"ChatGPT": "#10a37f", "Gemini": "#8b5cf6", "Claude": "#f59e0b"}
+MODEL_COLORS = {"Perplexity": "#10a37f", "Gemini": "#8b5cf6", "Claude": "#f59e0b"}
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -362,36 +362,41 @@ def crawl_site(url: str, log) -> str:
 
 
 def bedrock_generate_prompts(brand, domain, tagline, products, topics, competitors, n) -> list[str] | None:
-    """Call Bedrock Claude Haiku to generate smarter prompts (optional)."""
+    """Call Bedrock Claude Haiku to generate smart category-level buyer prompts. NO brand name in prompts (except 1-2 branded checks)."""
     if not HAS_BEDROCK:
         return None
     try:
         client = boto3.client("bedrock-runtime", region_name="us-east-1")
         comp_str = ", ".join(competitors[:4]) if competitors else "industry alternatives"
-        prod_str = ", ".join(products[:3]) if products else "software"
-        topic_str = ", ".join(topics[:3]) if topics else "technology"
-        sys_msg = "You are an SEO and AI-visibility expert."
+        prod_str = ", ".join(products[:3]) if products else "software/tool"
+        topic_str = ", ".join(topics[:4]) if topics else "technology"
         user_msg = (
-            f"Generate exactly {n} high-intent conversational search prompts that real users "
-            f"would type into ChatGPT, Gemini, or Claude when researching tools like '{brand}'.\n\n"
-            f"Context:\n"
+            f"You are an AI visibility researcher. Generate exactly {n} conversational search prompts "
+            f"that real buyers type into ChatGPT, Gemini, or Perplexity when researching solutions like '{brand}'.\n\n"
+            f"Brand context:\n"
             f"- Brand: {brand} ({domain})\n"
-            f"- Description: {tagline[:200] if tagline else 'N/A'}\n"
+            f"- What it does: {tagline[:300] if tagline else 'N/A'}\n"
             f"- Products/services: {prod_str}\n"
-            f"- Topics: {topic_str}\n"
-            f"- Main competitors: {comp_str}\n\n"
-            f"Rules:\n"
-            f"- Mix brand-specific (40%) and category-level (60%) queries\n"
-            f"- Include: review queries, comparison queries, 'best X for Y' queries, "
-            f"'should I use' queries, alternative queries\n"
-            f"- Year: 2025 or 2026\n"
-            f"- Return ONLY a JSON array of {n} strings, no explanation.\n"
-            f'Example: ["best CRM for startups 2025", "is HubSpot worth it for small teams", ...]'
+            f"- Category/topics: {topic_str}\n"
+            f"- Known competitors: {comp_str}\n\n"
+            f"RULES — read carefully:\n"
+            f"1. 80% of prompts must be CATEGORY-LEVEL (no brand name) — real buyer questions\n"
+            f"2. Only 20% (max 2-3) can mention '{brand}' directly — for validation\n"
+            f"3. Mix these types: best-in-category, comparison, how-to, review, buyer-decision, alternative, persona-specific, list/roundup, long-tail\n"
+            f"4. Each prompt: 50-150 chars, conversational, specific\n"
+            f"5. Include year 2025 or 2026 in some\n"
+            f"6. Use real buyer language — not marketing speak\n\n"
+            f"Examples of GOOD category prompts:\n"
+            f"- 'best conversion optimization tool for ecommerce 2026'\n"
+            f"- 'how do I fix in-app browser killing my Shopify sales'\n"
+            f"- 'should I use deep linking for influencer campaigns'\n"
+            f"- 'alternatives to branch.io for small business'\n"
+            f"- 'top link tracking tools for creators under $100/month'\n\n"
+            f"Return ONLY a JSON array of {n} strings, nothing else.\n"
         )
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 600,
-            "system": sys_msg,
+            "max_tokens": 800,
             "messages": [{"role": "user", "content": user_msg}]
         })
         resp = client.invoke_model(
@@ -400,15 +405,53 @@ def bedrock_generate_prompts(brand, domain, tagline, products, topics, competito
         )
         result = json.loads(resp["body"].read())
         text = result["content"][0]["text"].strip()
-        # Extract JSON array
         m = re.search(r'\[.*\]', text, re.DOTALL)
         if m:
             prompts = json.loads(m.group())
-            if isinstance(prompts, list) and len(prompts) >= n:
+            if isinstance(prompts, list) and len(prompts) >= 3:
                 return [str(p) for p in prompts[:n]]
-    except Exception as e:
-        pass  # Fall through to template prompts
+    except Exception:
+        pass
     return None
+
+
+def bedrock_analyze_site(site_text: str, brand: str, domain: str) -> dict:
+    """Use Bedrock Claude Haiku to extract real site intelligence from crawled text."""
+    if not HAS_BEDROCK or not site_text:
+        return {}
+    try:
+        client = boto3.client("bedrock-runtime", region_name="us-east-1")
+        snippet = site_text[:4000]
+        user_msg = (
+            f"Analyze this website content for '{brand}' ({domain}) and extract:\n\n"
+            f"Website text:\n{snippet}\n\n"
+            f"Return a JSON object with these fields:\n"
+            f"- tagline: one-sentence description of what they do (max 150 chars)\n"
+            f"- category: the main product/service category (e.g. 'conversion rate optimization', 'email marketing', 'project management')\n"
+            f"- products: list of up to 4 specific products/features they offer\n"
+            f"- topics: list of up to 6 relevant topics/keywords for this business\n"
+            f"- competitors: list of up to 5 likely competitor brand names\n"
+            f"- target_audience: who their customers are (e.g. 'Shopify merchants', 'B2B SaaS companies')\n"
+            f"- price_range: estimated price range if visible (e.g. '$19-$99/mo') or null\n\n"
+            f"Return ONLY valid JSON, nothing else."
+        )
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 500,
+            "messages": [{"role": "user", "content": user_msg}]
+        })
+        resp = client.invoke_model(
+            modelId="us.anthropic.claude-3-5-haiku-20241022-v1:0",
+            body=body, contentType="application/json", accept="application/json"
+        )
+        result = json.loads(resp["body"].read())
+        text = result["content"][0]["text"].strip()
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+    except Exception:
+        pass
+    return {}
 
 
 def generate_prompts_template(brand, domain, topics, competitors, n) -> list[str]:
@@ -443,68 +486,52 @@ def generate_prompts_template(brand, domain, topics, competitors, n) -> list[str
 
 
 def analyze_site(url: str, brand_override: str, num_prompts: int, log) -> dict:
-    """Full Step A pipeline: crawl → extract intel → generate prompts."""
-    domain     = extract_domain(url)
-    brand      = brand_override.strip() or brand_from_domain(domain)
-    site_text  = crawl_site(url, log)
+    """Full Step A pipeline: crawl → Bedrock site analysis → Bedrock prompt generation."""
+    domain    = extract_domain(url)
+    brand     = brand_override.strip() or brand_from_domain(domain)
+    site_text = crawl_site(url, log)
 
-    tagline, products, topics, competitors = "", [], [], []
+    tagline, products, topics, competitors, category, target_audience = "", [], [], [], "", ""
 
-    if site_text:
+    # Step A1: Use Bedrock to extract real site intelligence
+    if site_text and HAS_BEDROCK:
+        log("🤖 Analyzing site with Bedrock Claude Haiku...")
+        intel = bedrock_analyze_site(site_text, brand, domain)
+        if intel:
+            tagline        = intel.get("tagline", "")
+            category       = intel.get("category", "")
+            products       = intel.get("products", [])
+            topics         = intel.get("topics", [])
+            competitors    = intel.get("competitors", [])
+            target_audience= intel.get("target_audience", "")
+            log(f"✅ Site intel extracted by AI")
+    elif site_text:
+        # Fallback regex extraction
         lines = [l.strip() for l in site_text.split("\n") if l.strip()]
-        # Tagline = first line mentioning brand or first shortish line
         for line in lines[:15]:
             if 20 < len(line) < 180:
                 tagline = line; break
-
-        # Products — match "our X platform/tool/service" patterns
-        prod_re = re.compile(
-            r'(?:our|the)\s+([A-Z][a-zA-Z\s]{2,25}?)\s+'
-            r'(?:platform|software|tool|service|product|solution|app|suite)',
-            re.IGNORECASE
-        )
-        for m in prod_re.finditer(site_text[:5000]):
-            p = m.group(1).strip().title()
-            if p.lower() not in brand.lower() and p not in products:
-                products.append(p)
-            if len(products) >= 5: break
-
-        # Topics — keyword scan
-        TOPIC_KW = [
-            "analytics","marketing","AI","automation","data","cloud","security",
-            "e-commerce","CRM","SEO","content","social media","email","payments",
-            "HR","ERP","productivity","collaboration","DevOps","cybersecurity",
-            "customer support","sales","finance","recruitment","legal","healthcare",
-        ]
+        TOPIC_KW = ["analytics","marketing","AI","automation","ecommerce","CRM",
+                    "SEO","payments","SaaS","conversion","links","tracking","creator"]
         topics = [kw for kw in TOPIC_KW if kw.lower() in site_text.lower()][:6]
 
-        # Competitors — scan for known brand names
-        COMP_POOL = [
-            "HubSpot","Salesforce","Mailchimp","Shopify","WordPress","Notion",
-            "Monday","Asana","Slack","Zoom","Figma","Canva","Semrush","Ahrefs",
-            "Moz","Hotjar","Mixpanel","Amplitude","Intercom","Zendesk","Freshdesk",
-            "Jira","Confluence","Trello","ClickUp","Linear","Webflow","Squarespace",
-            "Wix","BigCommerce","Magento","Stripe","PayPal","Braintree","Twilio",
-            "SendGrid","Klaviyo","ActiveCampaign","Marketo","Pardot","Eloqua",
-        ]
-        competitors = [
-            c for c in COMP_POOL
-            if c.lower() != brand.lower() and c.lower() in site_text.lower()
-        ][:6]
-
     log(f"✅ Brand: {brand}  |  Domain: {domain}")
+    log(f"   Category: {category or 'general'}")
     log(f"   Topics: {', '.join(topics[:4]) or 'general'}")
+    log(f"   Target audience: {target_audience or 'unknown'}")
     log(f"   Competitors detected: {', '.join(competitors[:3]) or 'none'}")
 
-    # Try Bedrock for smarter prompts; fall back to templates
+    # Step A2: Use Bedrock to generate smart buyer prompts
     prompts = None
-    if HAS_BEDROCK and site_text:
-        log("🤖 Using Bedrock Claude Haiku for prompt generation ...")
+    if HAS_BEDROCK:
+        log("🤖 Generating AI-powered buyer prompts...")
+        # Augment topics with category
+        all_topics = ([category] if category else []) + topics
         prompts = bedrock_generate_prompts(
-            brand, domain, tagline, products, topics, competitors, num_prompts
+            brand, domain, tagline, products, all_topics, competitors, num_prompts
         )
         if prompts:
-            log(f"✅ Bedrock generated {len(prompts)} prompts")
+            log(f"✅ AI generated {len(prompts)} targeted prompts")
         else:
             log("⚠️  Bedrock prompt generation failed — using template prompts")
 
@@ -514,7 +541,8 @@ def analyze_site(url: str, brand_override: str, num_prompts: int, log) -> dict:
 
     return {
         "brand": brand, "domain": domain, "tagline": tagline,
-        "products": products, "topics": topics, "competitors": competitors,
+        "category": category, "products": products, "topics": topics,
+        "competitors": competitors, "target_audience": target_audience,
         "prompts": prompts,
     }
 
@@ -584,64 +612,77 @@ def _is_login_wall(url: str) -> bool:
 
 
 # ── ChatGPT ──────────────────────────────────────────────────────────────────
-async def query_chatgpt(context, prompt: str) -> dict:
+async def query_perplexity(context, prompt: str) -> dict:
+    """Query Perplexity.ai without login — works reliably in headless mode."""
     page = await context.new_page()
-    r = {"model":"ChatGPT","prompt":prompt,"response":"","sources":[],"mock":False,"error":None}
+    r = {"model":"Perplexity","prompt":prompt,"response":"","sources":[],"mock":False,"error":None}
     try:
-        await page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2500)
+        await page.goto("https://www.perplexity.ai/", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(3000)
 
-        if _is_login_wall(page.url):
-            r["error"] = "login_required"
-            r["response"] = "[Login required — ChatGPT redirected to login page]"
-            return r
-
-        # --- input ---
+        # Perplexity input selectors
         INPUT_SELS = [
-            '#prompt-textarea',
-            'textarea[data-id="root"]',
             'textarea[placeholder]',
-            'div[contenteditable="true"]',
             'textarea',
+            '[contenteditable="true"]',
+            'input[type="text"]',
         ]
-        filled = await _safe_fill(page, INPUT_SELS, prompt, timeout=10000)
-        if not filled:
-            r["error"] = "input_not_found"
-            r["response"] = "[Could not find ChatGPT input field]"
-            return r
-
-        await page.keyboard.press("Enter")
-        await page.wait_for_timeout(2000)
-
-        # --- wait for response to stop streaming ---
-        RESP_SELS = [
-            '[data-message-author-role="assistant"]',
-            '.agent-turn',
-            '.markdown.prose',
-            '[class*="prose"]',
-        ]
-        resp_sel = None
-        for sel in RESP_SELS:
+        filled = False
+        for sel in INPUT_SELS:
             try:
-                await page.wait_for_selector(sel, timeout=20000, state="visible")
-                resp_sel = sel
+                el = await page.wait_for_selector(sel, timeout=6000, state="visible")
+                await el.click()
+                await page.keyboard.type(prompt, delay=30)
+                filled = True
                 break
             except Exception:
                 continue
 
-        if resp_sel:
-            r["response"] = await _wait_stream_stop(page, resp_sel, stable_ms=3000, timeout_s=50)
-        else:
-            await page.wait_for_timeout(18000)
-            r["response"] = await page.inner_text("main") or await page.inner_text("body")
+        if not filled:
+            r["error"] = "input_not_found"
+            r["response"] = "[Could not find Perplexity input field]"
+            return r
 
-        # --- sources: look for citation links in the response turn ---
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(4000)
+
+        # Poll for stable response (Perplexity streams fast, usually 10-20s)
+        prev_len = 0
+        stable_count = 0
+        for _ in range(20):
+            await page.wait_for_timeout(2000)
+            try:
+                txt = await page.evaluate("document.body.innerText")
+                cur_len = len(txt)
+                if cur_len > 500 and cur_len == prev_len:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        break
+                else:
+                    stable_count = 0
+                prev_len = cur_len
+            except Exception:
+                break
+
+        # Extract response
+        full_text = await page.evaluate("document.body.innerText")
+        prompt_idx = full_text.find(prompt[:40])
+        if prompt_idx >= 0:
+            r["response"] = full_text[prompt_idx + len(prompt):].strip()[:4000]
+        else:
+            r["response"] = full_text[-4000:].strip()
+
+        # Strip UI boilerplate
+        for bp in ["Sign in", "Sign up", "Log in", "Pro", "Try Pro", "Perplexity"]:
+            if r["response"].startswith(bp):
+                r["response"] = r["response"][len(bp):].strip()
+
+        # Sources — Perplexity shows citation links
         try:
             links = await page.eval_on_selector_all(
-                'a[href^="http"]',
-                "els => els.map(e => e.href)"
+                'a[href^="http"]', "els => els.map(e => e.href)"
             )
-            r["sources"] = [l for l in links if "chatgpt.com" not in l][:15]
+            r["sources"] = [l for l in links if "perplexity.ai" not in l][:15]
         except Exception:
             pass
 
@@ -962,15 +1003,14 @@ async def run_live_queries(
         return []
 
     results = []
-    # ChatGPT is SKIPPED — Cloudflare blocks headless browsers
-    log("⛔ ChatGPT: SKIPPED — Cloudflare bot protection blocks headless browsers")
-    total   = len(prompts) * 2   # only Gemini + Claude
+    log("🚀 Running: Perplexity + Gemini + Claude (ChatGPT skipped — Cloudflare blocks headless)")
+    total   = len(prompts) * 3
     done    = 0
 
     QUERY_FNS = [
-        # ("ChatGPT", query_chatgpt),  # SKIPPED: Cloudflare-blocked in headless mode
-        ("Gemini",  query_gemini),
-        ("Claude",  query_claude),
+        ("Perplexity", query_perplexity),
+        ("Gemini",     query_gemini),
+        ("Claude",     query_claude),
     ]
 
     try:
@@ -1516,7 +1556,7 @@ def tab_per_model(m: dict):
     per_model_data = m.get("per_model", {})
     # Show all known models; mark ChatGPT as skipped, others as missing if no data
     for model in MODELS_ALL:
-        if model == "ChatGPT":
+        if model == "Perplexity":
             with st.expander("⛔ ChatGPT — Skipped (Cloudflare bot protection in headless mode)", expanded=False):
                 st.markdown(
                     "ChatGPT redirects headless browsers through Cloudflare's bot protection. "
